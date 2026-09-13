@@ -1,0 +1,130 @@
+"""
+Признаки для моделей качества.
+
+Зона ответственности: Person 3 (ML Engineer).
+
+Здесь живёт всё, что превращает сырую телеметрию 10-минутного шага
+в признаки, на которых модель реально может учиться.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Sequence
+
+import numpy as np
+import pandas as pd
+
+# Стандартные окна в часах. Шаг телеметрии 10 минут, то есть
+# 1 час = 6 точек, 12 часов = 72 точки.
+DEFAULT_LAGS_H: Sequence[float] = (1, 3, 6, 12)
+POINTS_PER_HOUR = 6
+
+
+def add_lags(
+    df: pd.DataFrame,
+    cols: List[str],
+    lags_h: Sequence[float] = DEFAULT_LAGS_H,
+) -> pd.DataFrame:
+    """Лаговые признаки. Только назад по времени, никогда вперёд."""
+    out = df.copy()
+    for c in cols:
+        for h in lags_h:
+            out[f"{c}__lag{h}h"] = df[c].shift(int(h * POINTS_PER_HOUR))
+    return out
+
+
+def add_rolling(
+    df: pd.DataFrame,
+    cols: List[str],
+    windows_h: Sequence[float] = DEFAULT_LAGS_H,
+) -> pd.DataFrame:
+    """
+    Скользящие средние и стандартные отклонения.
+
+    Среднее сглаживает шум прибора. Отклонение говорит, насколько
+    режим был устойчив — это хороший признак для оценки уверенности.
+    """
+    out = df.copy()
+    for c in cols:
+        for h in windows_h:
+            w = int(h * POINTS_PER_HOUR)
+            out[f"{c}__mean{h}h"] = df[c].rolling(w, min_periods=w // 2).mean()
+            out[f"{c}__std{h}h"] = df[c].rolling(w, min_periods=w // 2).std()
+    return out
+
+
+def wabt(t_in: pd.Series, t_out: pd.Series) -> pd.Series:
+    """
+    Средневзвешенная температура слоя катализатора.
+
+        WABT = T_вход + 2/3 * (T_выход - T_вход)
+
+    Стандартная отраслевая формула для адиабатического реактора
+    гидроочистки. Реакция экзотермическая, температура растёт по слою,
+    поэтому среднее арифметическое входа и выхода занижает реальную
+    температуру катализатора.
+
+    Практическое значение: реактор стабилизируется, если WABT держат
+    постоянной при меняющихся условиях.
+    """
+    return t_in + (2.0 / 3.0) * (t_out - t_in)
+
+
+def catalyst_age_days(index: pd.DatetimeIndex, cycle_start: str = "2023-01-01") -> pd.Series:
+    """
+    Возраст катализатора в сутках.
+
+    ДОПУЩЕНИЕ: реальная дата начала цикла в пакете не выдана.
+    Принимается 2023-01-01. Признак всё равно полезен как тренд:
+    катализатор садится, требуемая температура растёт.
+    """
+    start = pd.Timestamp(cycle_start)
+    return pd.Series((index - start).days, index=index, name="catalyst_age_days")
+
+
+def normalized_temperature(
+    measured_temp: pd.Series,
+    predicted_temp_for_target: pd.Series,
+) -> pd.Series:
+    """
+    Нормализованная температура — прокси деактивации катализатора.
+
+    TODO(Person 3): реализовать через обратную задачу к GOModel.
+
+    Идея: сколько градусов нужно, чтобы получить фиксированную серу
+    (например 8 мг/кг) при текущем расходе и качестве сырья.
+    Её рост во времени и есть потеря активности катализатора.
+    Наклон этого ряда — скорость деактивации, градусов в месяц.
+
+    Это то, что агент надёжности вернёт как severity_index.
+    """
+    return measured_temp - predicted_temp_for_target
+
+
+def lag_by_feed_rate(feed_rate: float, base_lag_h: float = 4.0,
+                     ref_feed: float = 256.0) -> float:
+    """
+    Оценка запаздывания отклика, зависящая от нагрузки.
+
+    Чем выше расход сырья, тем меньше время пребывания в реакторе
+    и тем быстрее изменение температуры доходит до продукта.
+
+    TODO(Person 3): подобрать base_lag_h по кросс-корреляции
+    ПАК-серы с температурой отдельно по квартилям расхода.
+    Пока это допущение, а не измеренная величина.
+    """
+    if feed_rate is None or feed_rate <= 0:
+        return base_lag_h
+    return float(base_lag_h * ref_feed / feed_rate)
+
+
+def time_split(df: pd.DataFrame, cutoff: str = "2025-12-31"):
+    """
+    Сплит строго по времени.
+
+    Случайное перемешивание строк временного ряда запрещено ТЗ:
+    оно даёт утечку информации из будущего в обучение.
+    Функция существует, чтобы никто случайно не вызвал train_test_split.
+    """
+    c = pd.Timestamp(cutoff)
+    return df[df.index <= c], df[df.index > c]

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+artifacts/traces/*.json
+data/*.csv
+data/*.xlsx
+.venv/
