@@ -17,7 +17,7 @@ import pandas as pd
 
 from ..contracts import Measurement, ProcessState
 from .loaders import FEED_POINT, TARGET_POINT, detect_stuck
-from .tags import load_config, refusal_rules, refusal_rules
+from .tags import load_config, refusal_rules
 
 # Три обязательных демо-сценария из раздела 6 ТЗ
 SCENARIOS = ("normal", "quality_risk", "degraded_data")
@@ -34,15 +34,43 @@ def build_demo_state(scenario: str = "normal", ts: Optional[datetime] = None) ->
 
     # базовый режим, значения взяты из реальных диапазонов телеметрии
     tags: Dict[str, float] = {
-        "242000:T5": 365.1,     # температура ГСС на выходе Р-201
-        "242000:F26": 256.2,    # расход сырья объёмный
-        "242000:P24": 0.59,     # свежий ВСГ
+        # медианы по очищенной истории 2023-2026, см. config/constraints.yaml
+        "242000:T5": 370.4,     # температура реактора Р-201
+        "242000:F26": 258.6,    # расход сырья объёмный
         "242000:T18": 68.7,     # похоже на ВА вспышки
-        "AVT:T33": 348.2,       # низ К-2
-        "AVT:F30": 61.4,        # отбор фр.290-350
-        "AVT:F32": 44.0,        # отбор фр.240-290
-        "AVT:F65": 219.3,       # производительность К-2
-        "AVT:P67": 1.10,        # давление верха К-2
+        # Person 3, Stage 2: лаги/волатильность T5 -- сильнейший признак
+        # для серы (std3h corr 0.45 в аудите), смещения от T5 взяты с
+        # реальной строки телеметрии, чтобы не повторить баг Stage 1
+        # (несогласованный синтетический снимок ломал формулу D15)
+        "242000:T5__lag3h": 366.4,
+        "242000:T5__lag6h": 367.8,
+        "242000:T5__std3h": 1.95,
+        "242000:T5__std6h": 1.68,
+        # теги формулы 24-2000:GODT:CFPP (models/vak_formulas.godt_cfpp)
+        "242000:T23": 238.2,
+        "242000:P8": 0.186,
+        "242000:F9": 189.2,
+        "242000:W7": 0.188,
+        "242000:P24": 0.62,
+        "AVT:F30": 128.4,       # отбор фр.290-350
+        "AVT:F32": 81.7,        # отбор фр.240-290
+        "AVT:F28": 275.6,       # пар в К-9
+        "AVT:F14": 253.5,       # 1 ЦО
+        "AVT:P22": 1.12,        # давление верха К-2
+        "AVT:T33": 338.3,       # низ К-2 (признак, не управляемая)
+        "AVT:T71": 304.3,       # температура отбора ДТ (признак)
+        "AVT:F65": 922.4,       # производительность К-2 (возмущение)
+        # Person 3: медианы по очищенной истории, нужны формулам ВАК
+        # (vak_formulas.avt_240_350_ebp, avt_350_d15, avt_350_cfpp)
+        "AVT:F36": 131.3,
+        "AVT:T66": 254.1,   # нужен avt_240_350_d15 после исправления куска (Stage 2)
+        "AVT:T37": 60.9,
+        "AVT:T40": 177.6,
+        "AVT:T58": 58.3,
+        "AVT:T42": 285.7,
+        "AVT:T48": 354.7,
+        "AVT:F31": 537.7,
+        "AVT:F57": 33.4,
     }
     dq_flags: List[str] = []
 
@@ -59,9 +87,9 @@ def build_demo_state(scenario: str = "normal", ts: Optional[datetime] = None) ->
 
     if scenario == "quality_risk":
         # режим утяжелился: больше отбор ДТ, ниже температура реактора
-        tags["AVT:F30"] = 66.5
-        tags["AVT:T33"] = 355.0
-        tags["242000:T5"] = 361.0
+        tags["AVT:F30"] = 141.0     # отбор поднят, хвост тяжелее
+        tags["AVT:F32"] = 89.0
+        tags["242000:T5"] = 366.5   # температура реактора ниже обычной
         pak["sulfur_mgkg"] = Measurement(9.6, ts, 0.0, "PAK", "mg/kg")
         lims["sulfur_mgkg"] = Measurement(9.4, ts - timedelta(hours=9), 540.0, "LIMS", "mg/kg")
 
