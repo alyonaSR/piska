@@ -27,7 +27,7 @@ from typing import Dict, Optional
 
 from ..contracts import Interval, ProcessState, QualityAssess
 from ..data.tags import quality_specs, refusal_rules
-from ..models import AVTModel, GOModel
+from ..models import load_default_avt, load_default_go
 from ..models.features import catalyst_age_days_scalar
 
 
@@ -35,11 +35,13 @@ class QualityAgent:
     """Заглушка с физически осмысленным поведением, чтобы цикл работал уже сегодня."""
 
     def __init__(self, avt_model=None, go_model=None):
-        # Person 3 подменяет эти два объекта обученными.
+        # Person 3: подмена на обученные модели, если артефакты в
+        # artifacts/models/ есть (load_default_* сами проверяют файл и
+        # откатываются на formula-only, если его нет -- см. models/loading.py).
         # Сигнатура predict(features) -> dict[str, Interval] не меняется,
         # поэтому подмена не затрагивает ни один другой слой.
-        self.avt = avt_model or AVTModel()
-        self.go = go_model or GOModel()
+        self.avt = avt_model or load_default_avt()
+        self.go = go_model or load_default_go()
         self.model_id = f"{self.avt.model_id}+{self.go.model_id}"
 
     # ------------------------------------------------------------------

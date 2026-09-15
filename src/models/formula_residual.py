@@ -16,9 +16,10 @@
     нужно для той же точности, чем на голом ML
   - один класс тестируется один раз, а не N раз на N показателей
 
-Интервал сейчас -- эмпирические квантили остатка на калибровочном
-хвосте (chronological, без shuffle). TODO(Stage 3): заменить на split
-conformal / adaptive conformal inference из research.pdf.
+Интервал -- split conformal prediction с онлайн-адаптацией (Adaptive
+Conformal Inference), см. conformal.py. Stage 3 из research.pdf,
+заменяет прежнюю эвристику "эмпирические 10/90 перцентили остатка без
+поправки на конечную выборку и без доказанной гарантии покрытия".
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 from ..contracts import Interval
+from .conformal import ConformalResidualBounds
 
 try:
     import lightgbm as lgb
@@ -57,8 +59,8 @@ class FormulaPlusResidual:
 
     def __post_init__(self):
         self._model = None
-        self._resid_lo = None   # квантиль 0.1 остатка на калибровке
-        self._resid_hi = None   # квантиль 0.9 остатка на калибровке
+        self._conformal: Optional[ConformalResidualBounds] = None
+        self._resid_bias = 0.0  # медиана остатка на калибровке, см. fit()
         self._n_train = 0
         self._n_calib = 0
 
@@ -124,14 +126,34 @@ class FormulaPlusResidual:
             safe_calib = X_calib[self.feature_cols].rename(columns=_safe_name)
             pred_calib = base_calib + model.predict(safe_calib)
             err = (y_calib - pred_calib)
-            self._resid_lo = float(np.quantile(err, 0.1))
-            self._resid_hi = float(np.quantile(err, 0.9))
+
+            # НАЙДЕНО (Stage 2 bias-фикс): калибровочный остаток не
+            # центрирован в нуле -- модель обучена на первых train_frac
+            # исторических точках, а calib -- уже дальше по времени
+            # (chronological split, не shuffle). На реальном демо-сценарии
+            # (дата ближе к концу истории, чем к train-части) это давало
+            # систематическое ЗАВЫШЕНИЕ серы на ~2-2.5 мг/кг относительно
+            # ЛИМС -- не шум, устойчивый сдвиг на всех трёх demo-сценариях.
+            # Медиана остатка -- честная оценка сдвига (устойчивее к
+            # выбросам, чем среднее), добавляется к точечному прогнозу.
+            self._resid_bias = float(np.median(err))
+            err_debiased = err - self._resid_bias
+
+            # Stage 3: split conformal + ACI вместо наивных np.quantile.
+            # Калибруется на ДЕ-СМЕЩЁННОМ остатке, чтобы интервал был
+            # честной оценкой оставшейся неопределённости вокруг уже
+            # скорректированного центра, а не заодно тащил на себе
+            # исправление смещения.
+            self._conformal = ConformalResidualBounds().fit(err_debiased)
             self._n_calib = len(X_calib)
         else:
             # мало данных на калибровку -- эвристический запас,
             # честно шире, чем typical residual std
             spread = float(resid_train.std()) if len(resid_train) > 1 else 1.0
-            self._resid_lo, self._resid_hi = -1.5 * spread, 1.5 * spread
+            self._resid_bias = 0.0
+            self._conformal = ConformalResidualBounds().fit(
+                np.array([-1.5 * spread, 1.5 * spread])
+            )
 
         return self
 
@@ -153,27 +175,76 @@ class FormulaPlusResidual:
         row = pd.DataFrame([{c: features.get(c) for c in self.feature_cols}])
         safe_row = row[self.feature_cols].rename(columns=_safe_name)
         resid = float(self._model.predict(safe_row)[0])
-        mean = base + resid
-        lo = mean + (self._resid_lo or -1.0)
-        hi = mean + (self._resid_hi or 1.0)
+        # + resid_bias: коррекция систематического сдвига калибровки, см. fit()
+        mean = base + resid + (self._resid_bias or 0.0)
+        if self._conformal is not None:
+            offset_lo, offset_hi = self._conformal.bounds()
+        else:
+            offset_lo, offset_hi = -1.0, 1.0
+        lo, hi = mean + offset_lo, mean + offset_hi
         if lo > hi:
             lo, hi = hi, lo
         return Interval(mean, lo, hi)
 
     # ------------------------------------------------------------------
+    def observe(self, features: Dict[str, float], y_true: float) -> None:
+        """
+        Adaptive Conformal Inference: онлайн-шаг, когда пришёл РЕАЛЬНЫЙ
+        факт (новый анализ ЛИМС) для ранее сделанного прогноза.
+
+        Не вызывается автоматически ни из какого продакшен-цикла --
+        для этого нужен живой поток решений с обратной связью, это
+        зона Orchestrator (Person 1). Метод готов быть подключённым,
+        покрыт tests/test_conformal.py.
+        """
+        if self._model is None or self._conformal is None:
+            return
+        row = pd.DataFrame([{c: features.get(c) for c in self.feature_cols}])
+        safe_row = row[self.feature_cols].rename(columns=_safe_name)
+        resid = float(self._model.predict(safe_row)[0])
+        pred = self.baseline(features) + resid + self._resid_bias
+        self._conformal.update(y_true - pred)
+
+    # ------------------------------------------------------------------
     def to_state(self) -> dict:
         return {
             "name": self.name, "model": self._model,
-            "resid_lo": self._resid_lo, "resid_hi": self._resid_hi,
+            "conformal": self._conformal.to_state() if self._conformal else None,
+            "resid_bias": self._resid_bias,
             "n_train": self._n_train, "n_calib": self._n_calib,
+            "fallback_mean": self.fallback_mean,
         }
 
     @classmethod
-    def from_state(cls, state: dict, formula_fn, formula_tags, feature_cols, monotone=None):
+    def from_state(cls, state: dict, formula_fn, formula_tags, feature_cols,
+                    monotone=None, fallback_mean: float = 0.0):
+        """
+        БАГ, НАЙДЕН И ИСПРАВЛЕН (до Stage 3): cls(...) без fallback_mean
+        тихо обнулял его (дефолт дата-класса 0.0), хотя вызывающая
+        сторона (AVTModel.load / GOModel.load) прекрасно знает правильное
+        значение из _SPECS. Для показателя без формулы и без обученного
+        остатка (feed_flash_c до появления LIMS-точки с flash_c на АВТ)
+        predict_one() тогда возвращал Interval(0.0, -8.0, 8.0) вместо
+        Interval(68.0, 60.0, 76.0) -- физически бессмысленный ноль вместо
+        честного "формула отсутствует, используем опорную константу".
+        Это и роняло spec_risk_prob до 1.0 на demo-сценарии normal.
+
+        Артефакты, сохранённые ДО Stage 3, хранят resid_lo/resid_hi
+        (плоские числа) вместо conformal (state калибратора) -- строим
+        ConformalResidualBounds из них как разовый откат, дальше
+        используется честная калибровка при следующем переобучении.
+        """
         obj = cls(state["name"], formula_fn, formula_tags, feature_cols, monotone)
         obj._model = state["model"]
-        obj._resid_lo = state["resid_lo"]
-        obj._resid_hi = state["resid_hi"]
+        if state.get("conformal") is not None:
+            obj._conformal = ConformalResidualBounds.from_state(state["conformal"])
+        elif state.get("resid_lo") is not None and state.get("resid_hi") is not None:
+            legacy = ConformalResidualBounds()
+            legacy._hi_scores = [state["resid_hi"]]
+            legacy._lo_scores = [-state["resid_lo"]]
+            obj._conformal = legacy
+        obj._resid_bias = state.get("resid_bias", 0.0)
         obj._n_train = state.get("n_train", 0)
         obj._n_calib = state.get("n_calib", 0)
+        obj.fallback_mean = state.get("fallback_mean", fallback_mean)
         return obj

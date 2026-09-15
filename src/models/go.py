@@ -81,11 +81,20 @@ def sulfur_arrhenius_baseline(m: Mapping) -> float:
 
 
 # показатель -> (формула ВАК или None, требуемые теги, fallback)
+#
+# УБРАН catalyst_age_days из sulfur_mgkg (эксперимент 2,
+# scripts/experiments_sulfur.py): признак буквально функция календарного
+# времени (допущение о старте цикла 2023-01-01), 29.4% gain в остатке --
+# главный подозреваемый в переносе temporal drift между train- и
+# calib-частью хронологического сплита. Без него: RMSE на калибровке
+# 2.260 против 2.295 с ним (не хуже, чуть лучше), а врождённое смещение
+# (медиана остатка ДО bias-коррекции) падает с -0.564 до +0.076 -- в 7 раз
+# меньше по модулю. Дешёвое улучшение, не требует новых данных.
 _SPECS = {
     "sulfur_mgkg": (sulfur_arrhenius_baseline, [
         "242000:T5", "242000:T5__lag3h", "242000:T5__lag6h",
         "242000:T5__std3h", "242000:T5__std6h",
-        "catalyst_age_days", "feed_ebp_c", "feed_d15_kgm3",
+        "feed_ebp_c", "feed_d15_kgm3",
     ], 8.5),
     "cfpp_c": (vak.godt_cfpp, vak.GODT["cfpp_c"][1], -5.0),
 }
@@ -114,9 +123,9 @@ class GOModel(BaseQualityModel):
 
     required_features -- реальные ключи, которые agents/quality.py
     обязан положить в словарь перед вызовом predict(): часть -- сырые
-    теги state.tag(...), часть (feed_*, catalyst_age_days) -- уже
-    посчитанные им самим из выхода AVTModel. Никакого anchor/delta
-    больше нет -- вход и выход абсолютные.
+    теги state.tag(...), часть (feed_*) -- уже посчитанные им самим
+    из выхода AVTModel. Никакого anchor/delta больше нет -- вход и
+    выход абсолютные.
     """
 
     outputs = ["sulfur_mgkg", "flash_c", "cfpp_c", "d15_kgm3"]
@@ -166,6 +175,7 @@ class GOModel(BaseQualityModel):
             out: FormulaPlusResidual.from_state(
                 states[out], fn, tags, tags,
                 monotone=monotone_vector(tags, "sulfur_mgkg") if out == "sulfur_mgkg" else None,
+                fallback_mean=_fb,
             )
             for out, (fn, tags, _fb) in _SPECS.items()
         }

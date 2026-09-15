@@ -131,8 +131,13 @@ def main():
         rmse_before = float(np.sqrt(((before - y) ** 2).mean()))
         model._models[out].fit(X, y)
         sub = model._models[out]
-        print(f"  {out}: RMSE baseline={rmse_before:.3f}  train={sub._n_train} calib={sub._n_calib}  "
-              f"остаток 10-90%=[{sub._resid_lo:.2f}, {sub._resid_hi:.2f}]" if sub._resid_lo is not None else "")
+        bounds_str = ""
+        if sub._conformal is not None:
+            offset_lo, offset_hi = sub._conformal.bounds()
+            bounds_str = (f"  bias={sub._resid_bias:.2f}  "
+                          f"conformal offset=[{offset_lo:.2f}, {offset_hi:.2f}]")
+        print(f"  {out}: RMSE baseline={rmse_before:.3f}  train={sub._n_train} "
+              f"calib={sub._n_calib}{bounds_str}")
 
     out_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "artifacts", "models")

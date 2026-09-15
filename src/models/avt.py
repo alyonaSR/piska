@@ -118,7 +118,7 @@ class AVTModel(BaseQualityModel):
         import joblib
         states = joblib.load(path)
         models = {
-            out: FormulaPlusResidual.from_state(states[out], fn, tags, tags)
+            out: FormulaPlusResidual.from_state(states[out], fn, tags, tags, fallback_mean=_fb)
             for out, (fn, tags, _fb) in _SPECS.items()
         }
         return cls(models=models)
