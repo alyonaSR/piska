@@ -41,7 +41,7 @@ class OptimizerAgent:
         reliability: ReliabilityAssess,
         active_vars: List[str] = None,
     ) -> List[Candidate]:
-        active_vars = active_vars or ["242000:T5", "AVT:F30"]
+        active_vars = active_vars or ["242000:T5", "AVT:F30"]  # см. constraints.yaml
         specs = manipulated_vars()
 
         grids: Dict[str, List[float]] = {}
@@ -93,7 +93,9 @@ class OptimizerAgent:
 
         TODO(Person 4): откалибровать веса или заменить на энергозатраты.
         """
-        return 1.0 * deltas.get("242000:T5", 0.0) - 0.6 * deltas.get("AVT:F30", 0.0)
+        return (1.0 * deltas.get("242000:T5", 0.0)
+                - 0.25 * deltas.get("AVT:F30", 0.0)
+                - 0.25 * deltas.get("AVT:F32", 0.0))
 
     @staticmethod
     def _severity_delta(deltas: Dict[str, float]) -> float:

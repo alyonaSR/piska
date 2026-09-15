@@ -16,7 +16,7 @@ L1a. Агент качества.
 Такое разделение нужно, чтобы Person 1 и Person 3 не правили один файл.
 
 ЦЕПОЧКА: AVTModel предсказывает качество дизельной фракции, уходящей
-в гидроочистку. Её T95 становится ВХОДОМ GOModel. Чем тяжелее хвост,
+в гидроочистку. Её конец кипения (EBP) становится ВХОДОМ GOModel. Чем тяжелее хвост,
 тем труднее удаляемая сера и тем более жёсткий режим нужен на ГО.
 Это и есть связанность цепочки из ТЗ, выраженная в коде.
 """
@@ -88,7 +88,7 @@ class QualityAgent:
         go_features = {
             "sulfur_anchor": anchor,
             "d_go_temp_c": deltas.get("242000:T5", 0.0),
-            "d_feed_t95_c": avt_new["feed_t95_c"].mean - avt_now["feed_t95_c"].mean,
+            "d_feed_tail_c": avt_new["feed_ebp_c"].mean - avt_now["feed_ebp_c"].mean,
             "feed_flash_c": avt_new["feed_flash_c"].mean,
             "feed_cfpp_c": avt_new["feed_cfpp_c"].mean,
             "feed_d15_kgm3": avt_new["feed_d15_kgm3"].mean,
@@ -139,12 +139,16 @@ class QualityAgent:
     def _drivers(self, state: ProcessState, deltas: Dict[str, float]) -> list:
         """TODO(Person 3): заменить на SHAP по обученной модели."""
         out = []
+        # пороги = p75 и p25 по очищенной истории, см. config/constraints.yaml
         f30 = state.tag("AVT:F30")
-        if f30 and f30 > 66.0:
+        if f30 and f30 > 140.0:
             out.append(f"высокий отбор дизельной фракции AVT:F30={f30:.1f} т/ч, хвост тяжелее")
+        f32 = state.tag("AVT:F32")
+        if f32 and f32 > 90.0:
+            out.append(f"высокий отбор AVT:F32={f32:.1f} т/ч")
         t5 = state.tag("242000:T5")
-        if t5 and t5 < 361.0:
-            out.append(f"низкая температура реактора 242000:T5={t5:.1f} C, severity недостаточна")
+        if t5 and t5 < 367.0:
+            out.append(f"температура реактора 242000:T5={t5:.1f} C ниже обычной, severity недостаточна")
         for k, v in deltas.items():
             out.append(f"проверяется изменение {k} на {v:+.1f}")
         return out

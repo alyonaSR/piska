@@ -6,7 +6,10 @@
 ЧТО ПРЕДСКАЗЫВАЕТ: качество ТОВАРНОГО дизельного топлива.
 Главный показатель — сера, по ней жёсткое ограничение 10 мг/кг.
 
-ВХОД: режим гидроочистки плюс выход AVTModel. Именно так цепочка
+ВХОД: режим гидроочистки плюс выход AVTModel. Ключ d_feed_tail_c
+назван по СМЫСЛУ (изменение тяжести хвоста сырья, градусы), а не по
+конкретной лабораторной точке. Сейчас под ним EBP; если окажется, что
+T90 работает лучше, это меняется внутри models/ и контракт не трогается. Именно так цепочка
 АВТ -> ГО становится видна в коде, а не на словах.
 
 ЧТО ИЗВЕСТНО ИЗ РАЗВЕДКИ ДАННЫХ:
@@ -62,21 +65,21 @@ class GOModel(BaseQualityModel):
     из сигнатуры уйдёт, и это надо согласовать с Person 1.
     """
 
-    required_features = ["sulfur_anchor", "d_go_temp_c", "d_feed_t95_c"]
+    required_features = ["sulfur_anchor", "d_go_temp_c", "d_feed_tail_c"]
     outputs = ["sulfur_mgkg", "flash_c", "cfpp_c", "d15_kgm3"]
     model_id = "go_stub_v0"
 
     def predict(self, features: Dict[str, float]) -> Dict[str, Interval]:
         anchor = features.get("sulfur_anchor", 8.5)
         d_temp = features.get("d_go_temp_c", 0.0)
-        d_t95 = features.get("d_feed_t95_c", 0.0)
+        d_tail = features.get("d_feed_tail_c", 0.0)
 
         # знаки: горячее -> сера ниже; тяжелее хвост -> сера выше
-        sulfur = anchor - 0.35 * d_temp + 0.37 * d_t95
+        sulfur = anchor - 0.35 * d_temp + 0.37 * d_tail
 
         # чем крупнее шаг, тем шире интервал: модель уверена только
         # рядом с режимами, которые видела в обучающих данных
-        half = 0.7 + 0.15 * abs(d_temp) + 0.17 * abs(d_t95)
+        half = 0.7 + 0.15 * abs(d_temp) + 0.17 * abs(d_tail)
 
         # эти три показателя задаются разделением на АВТ, гидроочистка
         # меняет их слабо и предсказуемо

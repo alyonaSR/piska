@@ -3,6 +3,10 @@
 
 Зона ответственности: Person 3 (ML Engineer).
 
+ЦЕЛЕВАЯ ВЕЛИЧИНА ЦЕПОЧКИ: feed_ebp_c, конец кипения. T95 выбран НЕ был:
+формулы ВАК для AVT6:240-350 есть только на D15, T50, EBP и CFPP,
+а EBP и T95 сырья коррелируют на 0.91, то есть несут одно и то же.
+
 ЧТО ПРЕДСКАЗЫВАЕТ: качество дизельной фракции, которая уходит с АВТ
 в гидроочистку. Это НЕ товарный продукт, а сырьё следующей стадии.
 
@@ -40,12 +44,14 @@ class AVTModel(BaseQualityModel):
       выше температура низа К-2     -> отбор глубже   -> T95 растёт
     """
 
-    required_features = ["AVT:F30", "AVT:T33"]
-    outputs = ["feed_t95_c", "feed_d15_kgm3", "feed_cfpp_c", "feed_flash_c"]
-    model_id = "avt_stub_v0"
+    required_features = ["AVT:F30", "AVT:F32", "AVT:F28", "AVT:F14", "AVT:P22"]
+    outputs = ["feed_ebp_c", "feed_d15_kgm3", "feed_cfpp_c", "feed_flash_c"]
+    model_id = "avt_stub_v1"
 
-    # опорная точка, относительно которой заданы коэффициенты заглушки
-    REF = {"AVT:F30": 61.4, "AVT:T33": 348.2}
+    # Опорная точка = МЕДИАНЫ по истории после отсечения простоев
+    # и маркеров 307.0. Не выдуманные числа: см. config/constraints.yaml.
+    REF = {"AVT:F30": 128.4, "AVT:F32": 81.7, "AVT:F28": 275.6,
+           "AVT:F14": 253.5, "AVT:P22": 1.12}
 
     def predict(self, features: Dict[str, float]) -> Dict[str, Interval]:
         """
@@ -57,18 +63,30 @@ class AVTModel(BaseQualityModel):
           3. интервал через квантильную регрессию (alpha 0.1 / 0.9)
         """
         f30 = features.get("AVT:F30", self.REF["AVT:F30"])
-        t33 = features.get("AVT:T33", self.REF["AVT:T33"])
+        f32 = features.get("AVT:F32", self.REF["AVT:F32"])
+        f28 = features.get("AVT:F28", self.REF["AVT:F28"])
+        f14 = features.get("AVT:F14", self.REF["AVT:F14"])
+        p22 = features.get("AVT:P22", self.REF["AVT:P22"])
 
-        d_f30 = f30 - self.REF["AVT:F30"]
-        d_t33 = t33 - self.REF["AVT:T33"]
+        d30 = f30 - self.REF["AVT:F30"]
+        d32 = f32 - self.REF["AVT:F32"]
+        d28 = f28 - self.REF["AVT:F28"]
+        d14 = f14 - self.REF["AVT:F14"]
+        d22 = p22 - self.REF["AVT:P22"]
 
-        t95 = 347.0 + 0.60 * d_f30 + 0.25 * d_t33
-        d15 = 840.0 + 0.30 * d_f30
-        cfpp = -5.0 + 0.25 * d_f30
-        flash = 68.0 + 0.30 * d_t33 - 0.15 * d_f30
+        # Знаки и относительные веса взяты из корреляций с ЛИМС EBP
+        # сырья гидроочистки (n=1260, очищенные данные) и из физики:
+        #   отбор вверх            -> хвост тяжелее
+        #   отгонный пар вверх     -> конец кипения ниже
+        #   давление верха вверх   -> хвост легче
+        ebp = (365.0 + 0.25 * d30 + 0.30 * d32
+               - 0.02 * d28 + 0.03 * d14 - 12.0 * d22)
+        d15 = 840.0 + 0.08 * d30 + 0.10 * d32
+        cfpp = -5.0 + 0.06 * d30 + 0.07 * d32
+        flash = 68.0 - 0.04 * d30 - 0.05 * d32 + 0.01 * d28
 
         return {
-            "feed_t95_c": Interval(t95, t95 - 4.0, t95 + 4.0),
+            "feed_ebp_c": Interval(ebp, ebp - 4.0, ebp + 4.0),
             "feed_d15_kgm3": Interval(d15, d15 - 3.0, d15 + 3.0),
             "feed_cfpp_c": Interval(cfpp, cfpp - 2.0, cfpp + 2.0),
             "feed_flash_c": Interval(flash, flash - 3.0, flash + 3.0),
