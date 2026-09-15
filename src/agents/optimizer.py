@@ -41,13 +41,20 @@ class OptimizerAgent:
         reliability: ReliabilityAssess,
         active_vars: List[str] = None,
     ) -> List[Candidate]:
-        active_vars = active_vars or ["242000:T5", "AVT:F30"]  # см. constraints.yaml
+        # AVT:T33 добавлена (Person 4): AVTModel её уже поддерживает,
+        # третье измерение сетки не требует правок в models/ или quality.py.
+        active_vars = active_vars or ["242000:T5", "AVT:F30", "AVT:T33"]
         specs = manipulated_vars()
 
         grids: Dict[str, List[float]] = {}
         for tag in active_vars:
-            step = specs[tag]["max_step"] / self.n_steps
-            grids[tag] = [round(step * k, 3) for k in range(-self.n_steps, self.n_steps + 1)]
+            spec = specs[tag]
+            # grid_points задаётся в constraints.yaml персонально по переменной,
+            # чтобы шаг получался круглым числом (0.5 degC, 1.0 t/h), а не 1.333.
+            # Раньше единый self.n_steps делил max_step без оглядки на переменную.
+            n = int(spec.get("grid_points", self.n_steps))
+            step = spec["max_step"] / n
+            grids[tag] = [round(step * k, 3) for k in range(-n, n + 1)]
 
         candidates: List[Candidate] = []
         for i, combo in enumerate(itertools.product(*[grids[t] for t in active_vars])):
@@ -84,18 +91,31 @@ class OptimizerAgent:
     @staticmethod
     def _cost_proxy(deltas: Dict[str, float]) -> float:
         """
-        Прозрачный стоимостной прокси. Фактических экономических данных
-        в пакете нет, ТЗ такое разрешает при явном описании.
+        Прозрачный стоимостной прокси ЧИСТЫХ ЗАТРАТ. Фактических
+        экономических данных в пакете нет, ТЗ такое разрешает при явном
+        описании допущений.
 
-        Условные единицы за цикл:
-          +1.0 за каждый градус температуры реактора (топливо + водород)
-          -0.6 за каждую т/ч отбора дизельной фракции (выручка)
+        ИСПРАВЛЕНО (Person 4): раньше сюда подмешивался -0.6*ΔF30 — рост
+        отбора дизельной фракции одновременно снижал cost_proxy И
+        увеличивал yield_delta. Это двойной учёт одной и той же выгоды:
+        один раз как "рост выпуска", второй раз как "мнимая экономия".
+        Orchestrator сравнивает их как разные критерии лексикографической
+        цепочки (сначала запас, потом воздействие, потом severity, и
+        только в конце cost_proxy) — cost_proxy обязан быть чистыми
+        затратами, без части выгоды внутри.
 
-        TODO(Person 4): откалибровать веса или заменить на энергозатраты.
+        Условные единицы за цикл, обе статьи — расход энергии на нагрев:
+          +1.0 за каждый градус температуры реактора 242000:T5 (топливо + водород)
+          +0.5 за каждый градус температуры низа К-2 AVT:T33 (топливо на АВТ)
+        Рост выпуска (AVT:F30) в cost_proxy не входит — он есть в yield_delta.
+
+        TODO(Person 4): заменить веса на реальные энергозатраты, когда
+        появится хоть один экономический источник данных.
         """
-        return (1.0 * deltas.get("242000:T5", 0.0)
-                - 0.25 * deltas.get("AVT:F30", 0.0)
-                - 0.25 * deltas.get("AVT:F32", 0.0))
+        return (
+            1.0 * deltas.get("242000:T5", 0.0)
+            + 0.5 * deltas.get("AVT:T33", 0.0)
+        )
 
     @staticmethod
     def _severity_delta(deltas: Dict[str, float]) -> float:
