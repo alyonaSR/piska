@@ -5,89 +5,120 @@
 
 ЦЕЛЕВАЯ ВЕЛИЧИНА ЦЕПОЧКИ: feed_ebp_c, конец кипения. T95 выбран НЕ был:
 формулы ВАК для AVT6:240-350 есть только на D15, T50, EBP и CFPP,
-а EBP и T95 сырья коррелируют на 0.91, то есть несут одно и то же.
+а EBP и T95 сырья коррелируют на 0.91, то есть несут одно и то же
+(решение Person 1, подтверждено org-схемой: avt_diesel_t95_c на P&ID
+это тот же физический поток, что мы аппроксимируем через EBP).
 
 ЧТО ПРЕДСКАЗЫВАЕТ: качество дизельной фракции, которая уходит с АВТ
-в гидроочистку. Это НЕ товарный продукт, а сырьё следующей стадии.
+в гидроочистку (feed_ebp_c, feed_d15_kgm3, feed_cfpp_c, feed_flash_c).
 
-Именно здесь материализуется связанность цепочки из ТЗ. Выход этой
-модели становится входом GOModel: чем тяжелее хвост дизельной фракции
-(выше T95), тем труднее удаляемая сера и тем более жёсткий режим
-нужен на гидроочистке.
+АРХИТЕКТУРА (после Stage 0/1, см. models/vak_formulas.py и
+models/formula_residual.py):
 
-ЧТО МОЖНО ВЗЯТЬ ГОТОВЫМ: на листе ВАК выданы формулы
-  AVT6:240-350:D15, :T50, :EBP, :CFPP
-  AVT6:350:T50, :I350, :D15, :CFPP
-Это готовые виртуальные анализаторы, их не нужно обучать заново.
-ВНИМАНИЕ: коды тегов в формулах резолвятся ТОЛЬКО по столбцу АВТ
-справочника КИП. T6 на АВТ и на 24-2000 — разные величины.
+  Каждый показатель = формула ВАК (физически осмысленная опорная линия)
+  + LightGBM на остатке. Если рабочей формулы нет или она сломана --
+  baseline=0, это просто ML.
 
-ЧЕГО В ВАК НЕТ: серы. Ни одной формулы. Сера сырья, если понадобится,
-моделируется отдельно по ЛИМС точки отбора 'Гидроочистка, точка 1,
-ФРАКЦ_ДИЗ' (Mass.Sulfur, 132 значения).
+  feed_ebp_c    <- AVT6:240-350:EBP
+  feed_d15_kgm3 <- AVT6:240-350:D15  (НЕ AVT6:350:D15! У AVT6:350:D15 был
+                                       меньше RMSE в Stage 0 (6.3 против 13.7),
+                                       но это неправильный поток: "350" --
+                                       это фракция ТЯЖЕЛЕЕ дизеля, не сырьё
+                                       гидроочистки. Проверено на реальной
+                                       строке телеметрии: AVT6:350:D15 даёт
+                                       ~884 кг/м3, что не бьётся со спекой
+                                       товарного продукта 845 -- потому что
+                                       это буквально не тот материал.
+                                       AVT6:240-350:D15 (тот же кусок, что
+                                       и EBP) даёт ~871, ближе к реальному
+                                       ЛИМС точки 1 (медиана 878.8))
+  feed_cfpp_c   <- формулы нет: AVT6:240-350:CFPP сломана даже после
+                                 правки организаторов (corr -0.32, обратный
+                                 знак), а AVT6:350:CFPP -- снова не тот
+                                 поток (350+ вместо 240-350). Чистый ML.
+  feed_flash_c  <- формулы нет вообще ни на одном листе, чистый ML
+
+Признаки -- ТОЛЬКО текущий снимок (без лагов): ProcessState даёт только
+срез тегов на момент t (contracts.py), истории у agents/quality.py нет.
+Лаги нужны для серы (GOModel) и потребуют расширения ProcessState --
+это отдельный разговор с Person 1, не в рамках AVTModel.
+
+ЧТО МОЖНО ВЗЯТЬ ГОТОВЫМ vs ЧЕГО В ВАК НЕТ -- см. vak_formulas.py,
+там же таблица со статусом каждой формулы после аудита по ЛИМС.
 """
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 from ..contracts import Interval
+from . import vak_formulas as vak
 from .base import BaseQualityModel
+from .formula_residual import FormulaPlusResidual
+
+# показатель -> (формула ВАК или None, требуемые теги, fallback-константа
+# на случай formula_fn=None и необученной модели -- иначе Interval(0,...)
+# физически бессмысленен и ломает Gate)
+_SPECS = {
+    "feed_ebp_c": (vak.avt_240_350_ebp, vak.AVT_240_350["ebp_c"][1], 365.0),
+    "feed_d15_kgm3": (vak.avt_240_350_d15, vak.AVT_240_350["d15_kgm3"][1], 871.0),
+    # нет рабочей формулы для правильного куска -- используем теги EBP,
+    # residual-модель учится с нуля (formula_fn=None -> baseline=0)
+    "feed_cfpp_c": (None, vak.AVT_240_350["ebp_c"][1], -5.0),
+    "feed_flash_c": (None, vak.AVT_240_350["ebp_c"][1], 68.0),
+}
 
 
 class AVTModel(BaseQualityModel):
     """
-    ЗАГЛУШКА с физически правильными знаками.
+    Композиция из четырёх FormulaPlusResidual, по одному на показатель.
 
-    Знаки взяты из технологии, а не из корреляций в данных:
-      больше отбор дизельной фракции -> хвост тяжелее -> T95 растёт
-      выше температура низа К-2     -> отбор глубже   -> T95 растёт
+    Без обученного артефакта (fit()/load() не вызывались) каждый
+    показатель работает в режиме "только формула": предсказание точное
+    там, где формула точна, интервал намеренно широкий (+-8), чтобы
+    Gate не поверил непроверенному числу больше, чем оно того стоит.
+    Ровно так демо работает уже сегодня, без обучения -- это осознанное
+    свойство архитектуры, см. README ("никто никого не ждёт").
     """
 
-    required_features = ["AVT:F30", "AVT:F32", "AVT:F28", "AVT:F14", "AVT:P22"]
     outputs = ["feed_ebp_c", "feed_d15_kgm3", "feed_cfpp_c", "feed_flash_c"]
-    model_id = "avt_stub_v1"
+    required_features = sorted({t for _, tags, _ in _SPECS.values() for t in tags})
+    model_id = "avt_formula_residual_v1"
 
-    # Опорная точка = МЕДИАНЫ по истории после отсечения простоев
-    # и маркеров 307.0. Не выдуманные числа: см. config/constraints.yaml.
-    REF = {"AVT:F30": 128.4, "AVT:F32": 81.7, "AVT:F28": 275.6,
-           "AVT:F14": 253.5, "AVT:P22": 1.12}
-
-    def predict(self, features: Dict[str, float]) -> Dict[str, Interval]:
-        """
-        TODO(Person 3): заменить на ВАК-формулы плюс ML на остатках.
-
-        Порядок работ:
-          1. подставить формулы с листа ВАК как есть, проверить на ЛИМС
-          2. посмотреть остатки, обучить на них LightGBM
-          3. интервал через квантильную регрессию (alpha 0.1 / 0.9)
-        """
-        f30 = features.get("AVT:F30", self.REF["AVT:F30"])
-        f32 = features.get("AVT:F32", self.REF["AVT:F32"])
-        f28 = features.get("AVT:F28", self.REF["AVT:F28"])
-        f14 = features.get("AVT:F14", self.REF["AVT:F14"])
-        p22 = features.get("AVT:P22", self.REF["AVT:P22"])
-
-        d30 = f30 - self.REF["AVT:F30"]
-        d32 = f32 - self.REF["AVT:F32"]
-        d28 = f28 - self.REF["AVT:F28"]
-        d14 = f14 - self.REF["AVT:F14"]
-        d22 = p22 - self.REF["AVT:P22"]
-
-        # Знаки и относительные веса взяты из корреляций с ЛИМС EBP
-        # сырья гидроочистки (n=1260, очищенные данные) и из физики:
-        #   отбор вверх            -> хвост тяжелее
-        #   отгонный пар вверх     -> конец кипения ниже
-        #   давление верха вверх   -> хвост легче
-        ebp = (365.0 + 0.25 * d30 + 0.30 * d32
-               - 0.02 * d28 + 0.03 * d14 - 12.0 * d22)
-        d15 = 840.0 + 0.08 * d30 + 0.10 * d32
-        cfpp = -5.0 + 0.06 * d30 + 0.07 * d32
-        flash = 68.0 - 0.04 * d30 - 0.05 * d32 + 0.01 * d28
-
-        return {
-            "feed_ebp_c": Interval(ebp, ebp - 4.0, ebp + 4.0),
-            "feed_d15_kgm3": Interval(d15, d15 - 3.0, d15 + 3.0),
-            "feed_cfpp_c": Interval(cfpp, cfpp - 2.0, cfpp + 2.0),
-            "feed_flash_c": Interval(flash, flash - 3.0, flash + 3.0),
+    def __init__(self, models: Optional[Dict[str, FormulaPlusResidual]] = None):
+        self._models = models or {
+            out: FormulaPlusResidual(name=out, formula_fn=fn, formula_tags=tags,
+                                      feature_cols=tags, fallback_mean=fb)
+            for out, (fn, tags, fb) in _SPECS.items()
         }
+
+    # ------------------------------------------------------------------
+    def predict(self, features: Dict[str, float]) -> Dict[str, Interval]:
+        return {out: model.predict_one(features) for out, model in self._models.items()}
+
+    # ------------------------------------------------------------------
+    def fit(self, tables: Dict[str, "tuple"]) -> "AVTModel":
+        """
+        TODO(Person 3, следующий шаг после первого обучения): вызывается
+        из scripts/train_avt.py, не напрямую. tables[output] = (X, y),
+        где X -- DataFrame с DatetimeIndex и колонками required_features,
+        y -- Series той же длины (значение ЛИМС, as-of присоединённое).
+        """
+        for out, model in self._models.items():
+            X, y = tables[out]
+            model.fit(X, y)
+        return self
+
+    def save(self, path: str) -> None:
+        import joblib
+        joblib.dump({out: m.to_state() for out, m in self._models.items()}, path)
+
+    @classmethod
+    def load(cls, path: str) -> "AVTModel":
+        import joblib
+        states = joblib.load(path)
+        models = {
+            out: FormulaPlusResidual.from_state(states[out], fn, tags, tags)
+            for out, (fn, tags, _fb) in _SPECS.items()
+        }
+        return cls(models=models)

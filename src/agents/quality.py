@@ -28,6 +28,7 @@ from typing import Dict, Optional
 from ..contracts import Interval, ProcessState, QualityAssess
 from ..data.tags import quality_specs, refusal_rules
 from ..models import AVTModel, GOModel
+from ..models.features import catalyst_age_days_scalar
 
 
 class QualityAgent:
@@ -66,11 +67,21 @@ class QualityAgent:
     # ------------------------------------------------------------------
     def _predict(self, state: ProcessState, deltas: Dict[str, float]) -> Dict[str, Interval]:
         """
-        Цепочка АВТ -> ГО. Две модели, два вызова.
+        Цепочка АВТ -> ГО. Обе модели вызываются ДВАЖДЫ — на текущем
+        режиме и на предлагаемом — разницу берёт вызывающий код, не
+        сама модель.
 
-        Логика приращений: измеренная сера уже содержит в себе весь
-        текущий режим. Поэтому AVTModel вызывается ДВАЖДЫ — на текущем
-        режиме и на предлагаемом — и в GOModel уходит разница по T95.
+        Stage 2: GOModel раньше работал через anchor+дельты (сера
+        считалась как измеренная плюс поправка). Это не позволяло
+        использовать лаги/волатильность температуры реактора, которые
+        оказались сильнейшим признаком для серы (std3h corr 0.45,
+        сырой T5 -- всего -0.09, см. models/go.py). Обучающих примеров
+        вида "что было бы при таком-то Δ" в истории нет, только
+        фактические траектории — поэтому GOModel, как и AVTModel,
+        теперь предсказывает АБСОЛЮТНОЕ значение по полному снимку
+        состояния, а разница считается здесь, вызовом дважды. Правка
+        сделана Person 3 в Stage 2 по согласованию (обычно этот файл —
+        Person 1), не пересекается с остальной логикой QualityAgent.
         """
         # 1. текущий режим АВТ
         f_now = {t: state.tag(t) for t in self.avt.required_features}
@@ -80,20 +91,32 @@ class QualityAgent:
         f_new = {t: (v + deltas.get(t, 0.0)) for t, v in f_now.items() if v is not None}
         avt_new = self.avt.predict(f_new)
 
-        # 3. якорь: фактически измеренная сера, приоритет ЛИМС -> ПАК
-        base = state.best_quality("sulfur_mgkg")
-        anchor = base.value if base and base.value is not None else 8.5
+        # 3. гидроочистка: сырые теги 24-2000 (в т.ч. предпосчитанные
+        # лаг/волатильность-ключи вида '242000:T5__std3h' -- их обязан
+        # положить в state.tags билдер состояния, см. data/state_builder.py)
+        # + выход AVTModel + возраст катализатора.
+        go_raw_now = {t: state.tag(t) for t in self.go.required_features
+                      if t.startswith("242000:")}
+        go_raw_now["catalyst_age_days"] = catalyst_age_days_scalar(state.ts)
+        go_raw_now = {k: v for k, v in go_raw_now.items() if v is not None}
 
-        # 4. гидроочистка получает выход АВТ как вход
-        go_features = {
-            "sulfur_anchor": anchor,
-            "d_go_temp_c": deltas.get("242000:T5", 0.0),
-            "d_feed_tail_c": avt_new["feed_ebp_c"].mean - avt_now["feed_ebp_c"].mean,
-            "feed_flash_c": avt_new["feed_flash_c"].mean,
-            "feed_cfpp_c": avt_new["feed_cfpp_c"].mean,
-            "feed_d15_kgm3": avt_new["feed_d15_kgm3"].mean,
-        }
-        return self.go.predict(go_features)
+        go_raw_new = {t: (v + deltas.get(t, 0.0)) for t, v in go_raw_now.items()}
+
+        def go_features(avt_out, go_raw):
+            return {
+                **go_raw,
+                "feed_ebp_c": avt_out["feed_ebp_c"].mean,
+                "feed_d15_kgm3": avt_out["feed_d15_kgm3"].mean,
+                "feed_cfpp_c": avt_out["feed_cfpp_c"].mean,
+                "feed_flash_c": avt_out["feed_flash_c"].mean,
+            }
+
+        go_now = self.go.predict(go_features(avt_now, go_raw_now))
+        go_new = self.go.predict(go_features(avt_new, go_raw_new))
+        self._last_go_delta = {
+            k: go_new[k].mean - go_now[k].mean for k in go_new
+        }  # для _drivers(), объяснимость эффекта действия
+        return go_new
 
     # ------------------------------------------------------------------
     def _confidence(self, state: ProcessState) -> float:

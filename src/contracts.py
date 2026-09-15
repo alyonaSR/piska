@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 
 
 # --------------------------------------------------------------------------
@@ -127,7 +127,7 @@ class QualityAssess:
     Ответ агента качества.
 
     predictions     — показатель -> Interval. Ключи: 'sulfur_mgkg', 'cfpp_c',
-                      'flash_c', 'd15_kgm3', 't95_c'
+                      'flash_c', 'd15_kgm3', 'ebp_c'
     spec_risk_prob  — 0..1, вероятность нарушить хотя бы одно требование спеки
     confidence      — 0..1, доверие к самому прогнозу.
                       Падает при старом ЛИМС, залипшем ПАК, режиме вне обучающей области.

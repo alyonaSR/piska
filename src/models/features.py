@@ -70,6 +70,22 @@ def wabt(t_in: pd.Series, t_out: pd.Series) -> pd.Series:
     return t_in + (2.0 / 3.0) * (t_out - t_in)
 
 
+def catalyst_age_days_scalar(ts, cycle_start: str = "2023-01-01") -> float:
+    """Версия catalyst_age_days для одного снимка времени (runtime, не обучение)."""
+    return float((pd.Timestamp(ts) - pd.Timestamp(cycle_start)).days)
+
+
+def arrhenius_term(wabt_celsius: float, ea_kj_mol: float = 55.0) -> float:
+    """
+    exp(-Ea / (R*T)), T в Кельвинах. Из research.pdf: Ea 47.2-66.1 кДж/моль
+    для HDS, 55 -- середина диапазона. Признак для LightGBM: должен
+    линеаризовать то, что для сырой температуры нелинейно (Аррениус).
+    """
+    R = 8.314e-3  # кДж/(моль*К)
+    T_k = wabt_celsius + 273.15
+    return float(np.exp(-ea_kj_mol / (R * T_k)))
+
+
 def catalyst_age_days(index: pd.DatetimeIndex, cycle_start: str = "2023-01-01") -> pd.Series:
     """
     Возраст катализатора в сутках.

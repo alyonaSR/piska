@@ -4,96 +4,169 @@
 Зона ответственности: Person 3 (ML Engineer).
 
 ЧТО ПРЕДСКАЗЫВАЕТ: качество ТОВАРНОГО дизельного топлива.
-Главный показатель — сера, по ней жёсткое ограничение 10 мг/кг.
+Главный показатель -- сера, по ней жёсткое ограничение 10 мг/кг.
 
-ВХОД: режим гидроочистки плюс выход AVTModel. Ключ d_feed_tail_c
-назван по СМЫСЛУ (изменение тяжести хвоста сырья, градусы), а не по
-конкретной лабораторной точке. Сейчас под ним EBP; если окажется, что
-T90 работает лучше, это меняется внутри models/ и контракт не трогается. Именно так цепочка
-АВТ -> ГО становится видна в коде, а не на словах.
+STAGE 2, СМЕНА АРХИТЕКТУРЫ: раньше модель работала в приращениях
+(sulfur_anchor + d_go_temp_c + d_feed_tail_c). Это ломало саму
+возможность использовать лаги/волатильность -- обучающих примеров
+вида "что было бы, если бы я изменил T5 на +2" в истории нет, есть
+только фактические траектории. Теперь GOModel предсказывает
+АБСОЛЮТНОЕ значение по полному вектору признаков, тем же паттерном,
+что уже AVTModel: agents/quality.py вызывает predict() дважды --
+на текущем состоянии и на состоянии с предложенным изменением -- и
+берёт разницу сам. Правка в quality.py сделана в этом же Stage 2
+(см. git log), согласовано с Person 1.
 
-ЧТО ИЗВЕСТНО ИЗ РАЗВЕДКИ ДАННЫХ:
+ПОЧЕМУ ЛАГИ КРИТИЧНЫ (Stage 2, аудит по данным):
+  Сырой T5 (температура реактора) коррелирует с серой ЛИМС на -0.09 --
+  почти ничего. Но T5 со сдвигом на 3-6ч -- уже -0.33, а ВОЛАТИЛЬНОСТЬ
+  T5 за 3 часа (std3h) -- 0.45, сильнейший признак из всех проверенных
+  (сильнее, чем любой сырой тег в Stage 0). Расход сырья (F26) и подача
+  ВСГ (P24) не коррелируют почти никак ни в каком виде (~-0.02..-0.06)
+  -- вероятно, оператор постоянно компенсирует их через T5, и сырой
+  расход из-за этого не виден. Это ровно тот сценарий "контур
+  регулирования маскирует физику", от которого предостерегает
+  base.py.EXPECTED_SIGNS.
 
-  1. Готовой ВАК-формулы на серу НЕТ. На листе ВАК есть 24-2000:GODT
-     для T90, T50, I250, D15, CloudPoint, T95, CFPP — серы среди них нет.
-     Это единственный жёсткий показатель, и он целиком ваша работа.
+  Три "тега качества" 24-2000 (T6, W7, P13), подписанные в справочнике
+  как связанные с серой, ПРОВЕРЕНЫ против настоящей ЛИМС/ПАК серы и НЕ
+  являются рабочими прокси (corr -0.01..-0.18) -- не использовать как
+  признак серы напрямую, справочник для них так же ненадёжен, как для
+  T6 отдельно.
 
-  2. Сера линейно из телеметрии не видна. Максимальная корреляция
-     любой из 26 колонок 242000_tags.csv с ПАК-серой 0.23 по модулю,
-     с лабораторной 0.19. Для сравнения вспышка ловится с 0.62,
-     плотность с 0.53. Мгновенная регрессия работать не будет:
-     нужны лаги, скользящие окна и нелинейность.
-
-  3. Часть ВАК-формул содержит члены вида LIMS:24-2000.Pipeline.D15.
-     Использовать такую формулу как прогноз и валидировать по тому же
-     ЛИМС — утечка из будущего. Заменять на последнее доступное
-     значение с известным возрастом.
-
-  4. Отклик запаздывает, и лаг зависит от расхода: чем выше нагрузка,
-     тем меньше мёртвое время между изменением температуры и эффектом
-     на серу в продукте. Подобрать по кросс-корреляции отдельно
-     по квартилям расхода.
-
-ПОРЯДОК РАБОТ:
-  1. признаки из features.py: лаги 1/3/6/12 ч, скользящие средние, WABT
-  2. LightGBM с monotone_constraints по base.monotone_vector()
-  3. интервал: квантильная регрессия или split conformal на калибровочном
-     куске 2025 года
-  4. сплит по времени: train до 2025-12-31, test 2026
+ЧТО ИЗВЕСТНО ИЗ РАЗВЕДКИ ДАННЫХ (Stage 0/1, не изменилось):
+  Готовой ВАК-формулы на серу нет. Для cfpp_c формула есть и рабочая
+  (24-2000:GODT:CFPP, исправлена организаторами на Q&A 15.09) --
+  используется как baseline. Для flash_c и d15_kgm3 формул нет --
+  осталась простая физическая аппроксимация от качества сырья АВТ
+  (см. _APPROX ниже), калибровка на LightGBM для них не Stage 2,
+  оставлено на потом.
 """
 
 from __future__ import annotations
 
-from typing import Dict
+import math
+from typing import Dict, Mapping, Optional
 
 from ..contracts import Interval
-from .base import BaseQualityModel
+from . import vak_formulas as vak
+from .base import BaseQualityModel, monotone_vector
+from .formula_residual import FormulaPlusResidual
+
+# ---------------------------------------------------------------------
+# Baseline серы: Аррениус с литературным Ea, НЕ подогнанным по данным.
+#
+# Stage 2, важная находка: обучила ML без формулы (formula_fn=None) --
+# LightGBM выбрал волатильность T5 (std3h/std6h) как главный признак,
+# а САМУ температуру T5 не использовал вообще (feature_importance=0),
+# хотя это единственная реальная ручка оптимизатора. Прямая подгонка
+# ln(сера) ~ 1/T по данным дала ОБРАТНЫЙ знак (горячее -> больше серы)
+# -- ровно тот контур регулирования, от которого предостерегает
+# base.py.EXPECTED_SIGNS: температуру поднимали, когда сырьё было
+# плохим, а не потому что подъём температуры ухудшал серу.
+#
+# Поэтому знак и Ea берутся из литературы (research.pdf, 47.2-66.1
+# кДж/моль, середина диапазона), калибруется по данным ТОЛЬКО
+# предэкспоненциальный множитель A (медиана факт/модель на очищенной
+# истории) -- это не меняет знак и не может воспроизвести confound.
+# ---------------------------------------------------------------------
+_R_KJ_MOL_K = 8.314e-3
+_SULFUR_EA_KJ_MOL = 55.0
+_SULFUR_ARRHENIUS_A = 0.000298  # см. докстринг: медиана y / медиана exp(Ea/RT)
+
+
+def sulfur_arrhenius_baseline(m: Mapping) -> float:
+    t_k = m["242000:T5"] + 273.15
+    return _SULFUR_ARRHENIUS_A * math.exp(_SULFUR_EA_KJ_MOL / (_R_KJ_MOL_K * t_k))
+
+
+# показатель -> (формула ВАК или None, требуемые теги, fallback)
+_SPECS = {
+    "sulfur_mgkg": (sulfur_arrhenius_baseline, [
+        "242000:T5", "242000:T5__lag3h", "242000:T5__lag6h",
+        "242000:T5__std3h", "242000:T5__std6h",
+        "catalyst_age_days", "feed_ebp_c", "feed_d15_kgm3",
+    ], 8.5),
+    "cfpp_c": (vak.godt_cfpp, vak.GODT["cfpp_c"][1], -5.0),
+}
+
+# flash_c и d15_kgm3: формулы ВАК на них нет (лист ГОДТ формул для них
+# не даёт), Stage 2 их не трогает -- физическая аппроксимация как была.
+_APPROX = {
+    "flash_c": lambda f: f.get("feed_flash_c", 68.0),
+    # -4.0 было наугад и физически неверно: feed_d15_kgm3 (сырьё, кусок
+    # 240-350) ~871 по факту, а товарный продукт (ЛИМС точка 2) ~836
+    # (медианы, Stage 2 проверка) -- разница ~35, не 4. Гидроочистка
+    # плюс дальнейший блендинг снижают плотность намного сильнее, чем
+    # предполагала заглушка. -34.0 -- калиброванная константа, не
+    # обученная модель (формулы ВАК на GODT:D15 нет, содержит LIMS-член).
+    "d15_kgm3": lambda f: f.get("feed_d15_kgm3", 840.0) - 34.0,
+}
+_APPROX_HALF = {"flash_c": 3.0, "d15_kgm3": 3.0}
 
 
 class GOModel(BaseQualityModel):
     """
-    ЗАГЛУШКА, работающая в приращениях.
+    sulfur_mgkg и cfpp_c -- FormulaPlusResidual (сера чистый ML, cfpp_c
+    формула+остаток). flash_c/d15_kgm3 -- простая физическая
+    аппроксимация от качества сырья АВТ, без обучения (Stage 2 в них
+    не заходит, см. докстринг модуля).
 
-    ВАЖНО, почему приращения, а не абсолютные значения. Измеренная
-    сера уже содержит в себе весь текущий режим, включая качество
-    сырья, возраст катализатора и всё остальное, чего мы не знаем.
-    Прибавлять к ней ещё и отклонение режима от опорной точки —
-    двойной счёт. Поэтому заглушка предсказывает, НА СКОЛЬКО
-    изменится сера от предложенного действия.
-
-    Обученная модель может работать иначе, но тогда якорь sulfur_anchor
-    из сигнатуры уйдёт, и это надо согласовать с Person 1.
+    required_features -- реальные ключи, которые agents/quality.py
+    обязан положить в словарь перед вызовом predict(): часть -- сырые
+    теги state.tag(...), часть (feed_*, catalyst_age_days) -- уже
+    посчитанные им самим из выхода AVTModel. Никакого anchor/delta
+    больше нет -- вход и выход абсолютные.
     """
 
-    required_features = ["sulfur_anchor", "d_go_temp_c", "d_feed_tail_c"]
     outputs = ["sulfur_mgkg", "flash_c", "cfpp_c", "d15_kgm3"]
-    model_id = "go_stub_v0"
+    required_features = sorted({t for _, tags, _ in _SPECS.values() for t in tags})
+    model_id = "go_formula_residual_v2"
 
-    def predict(self, features: Dict[str, float]) -> Dict[str, Interval]:
-        anchor = features.get("sulfur_anchor", 8.5)
-        d_temp = features.get("d_go_temp_c", 0.0)
-        d_tail = features.get("d_feed_tail_c", 0.0)
-
-        # знаки: горячее -> сера ниже; тяжелее хвост -> сера выше
-        sulfur = anchor - 0.35 * d_temp + 0.37 * d_tail
-
-        # чем крупнее шаг, тем шире интервал: модель уверена только
-        # рядом с режимами, которые видела в обучающих данных
-        half = 0.7 + 0.15 * abs(d_temp) + 0.17 * abs(d_tail)
-
-        # эти три показателя задаются разделением на АВТ, гидроочистка
-        # меняет их слабо и предсказуемо
-        feed_flash = features.get("feed_flash_c", 68.0)
-        feed_cfpp = features.get("feed_cfpp_c", -5.0)
-        feed_d15 = features.get("feed_d15_kgm3", 840.0)
-
-        flash = feed_flash
-        cfpp = feed_cfpp - 1.0          # гидроочистка слегка улучшает
-        d15 = feed_d15 - 4.0            # насыщение водородом снижает плотность
-
-        return {
-            "sulfur_mgkg": Interval(sulfur, sulfur - half, sulfur + half),
-            "flash_c": Interval(flash, flash - 3.0, flash + 3.0),
-            "cfpp_c": Interval(cfpp, cfpp - 2.0, cfpp + 2.0),
-            "d15_kgm3": Interval(d15, d15 - 3.0, d15 + 3.0),
+    def __init__(self, models: Optional[Dict[str, FormulaPlusResidual]] = None):
+        self._models = models or {
+            out: FormulaPlusResidual(
+                name=out, formula_fn=fn, formula_tags=tags, feature_cols=tags,
+                fallback_mean=fb,
+                # monotone только для серы -- главный риск задачи (см. base.py):
+                # без него модель может выучить контур регулирования и
+                # перепутать знак у температуры реактора
+                monotone=monotone_vector(tags, "sulfur_mgkg") if out == "sulfur_mgkg" else None,
+            )
+            for out, (fn, tags, fb) in _SPECS.items()
         }
+
+    # ------------------------------------------------------------------
+    def predict(self, features: Dict[str, float]) -> Dict[str, Interval]:
+        out = {name: model.predict_one(features) for name, model in self._models.items()}
+        for name, fn in _APPROX.items():
+            mean = float(fn(features))
+            half = _APPROX_HALF[name]
+            out[name] = Interval(mean, mean - half, mean + half)
+        return out
+
+    # ------------------------------------------------------------------
+    def fit(self, tables: Dict[str, "tuple"]) -> "GOModel":
+        """Вызывается из scripts/train_go.py. tables[out] = (X, y)."""
+        for out, model in self._models.items():
+            if out in tables:
+                X, y = tables[out]
+                model.fit(X, y)
+        return self
+
+    def save(self, path: str) -> None:
+        import joblib
+        joblib.dump({out: m.to_state() for out, m in self._models.items()}, path)
+
+    @classmethod
+    def load(cls, path: str) -> "GOModel":
+        import joblib
+        states = joblib.load(path)
+        models = {
+            out: FormulaPlusResidual.from_state(
+                states[out], fn, tags, tags,
+                monotone=monotone_vector(tags, "sulfur_mgkg") if out == "sulfur_mgkg" else None,
+            )
+            for out, (fn, tags, _fb) in _SPECS.items()
+        }
+        return cls(models=models)
