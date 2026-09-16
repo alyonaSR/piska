@@ -90,8 +90,12 @@ def build_demo_state(scenario: str = "normal", ts: Optional[datetime] = None) ->
         tags["AVT:F30"] = 141.0     # отбор поднят, хвост тяжелее
         tags["AVT:F32"] = 89.0
         tags["242000:T5"] = 366.5   # температура реактора ниже обычной
-        pak["sulfur_mgkg"] = Measurement(9.6, ts, 0.0, "PAK", "mg/kg")
-        lims["sulfur_mgkg"] = Measurement(9.4, ts - timedelta(hours=9), 540.0, "LIMS", "mg/kg")
+        # ТЗ просит период РИСКА ухудшения, а не свершившегося нарушения:
+        # запас до лимита есть, но меньше целевого, поэтому система обязана
+        # действовать. Уже нарушенную спеку проверяет отдельный тест
+        # режима восстановления (tests/test_integration.py).
+        pak["sulfur_mgkg"] = Measurement(9.3, ts, 0.0, "PAK", "mg/kg")
+        lims["sulfur_mgkg"] = Measurement(9.2, ts - timedelta(hours=9), 540.0, "LIMS", "mg/kg")
 
     if scenario == "degraded_data":
         # ЛИМС протух, ПАК залип

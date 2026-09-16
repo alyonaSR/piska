@@ -5,3 +5,4 @@ artifacts/traces/*.json
 data/*.csv
 data/*.xlsx
 .venv/
+.env

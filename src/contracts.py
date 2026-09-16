@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
-SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION = "1.4.0"
 
 
 # --------------------------------------------------------------------------
@@ -66,9 +66,17 @@ class Interval:
     lo: float
     hi: float
 
-    def conservative(self, direction: str) -> float:
-        """direction='upper' -> hi (для серы), 'lower' -> lo (для вспышки)."""
-        return self.hi if direction == "upper" else self.lo
+    def conservative(self, check_on: str) -> float:
+        """
+        Граница, по которой Gate проверяет ограничение.
+
+        Принимает значение поля check_on из config/constraints.yaml как
+        есть: 'hi' для серы (чем меньше, тем лучше), 'lo' для вспышки.
+        Синонимы 'upper'/'lower' оставлены, чтобы не ломать чужой код:
+        раньше здесь был третий словарь терминов на то же самое, и
+        вызывающая сторона переводила 'hi' в 'upper' руками.
+        """
+        return self.hi if check_on in ("hi", "upper") else self.lo
 
     @property
     def width(self) -> float:
@@ -105,16 +113,34 @@ class ProcessState:
             )
         return self.tags.get(key)
 
+    def usable_sources(self, param: str, max_age_min: float = 24 * 60) -> List[Measurement]:
+        """Все пригодные измерения показателя: ЛИМС и ПАК, в этом порядке."""
+        return [
+            m for m in (self.lims.get(param), self.pak.get(param))
+            if m is not None and m.is_usable(max_age_min)
+        ]
+
     def best_quality(self, param: str, max_age_min: float = 24 * 60) -> Optional[Measurement]:
         """
-        Приоритет источников из ТЗ: ЛИМС -> ПАК -> ВАК.
+        Приоритет ДОСТОВЕРНОСТИ из ТЗ: ЛИМС -> ПАК -> ВАК.
         Лабораторный результат считается контрольным фактом.
         """
-        for store in (self.lims, self.pak):
-            m = store.get(param)
-            if m is not None and m.is_usable(max_age_min):
-                return m
-        return None
+        usable = self.usable_sources(param, max_age_min)
+        return usable[0] if usable else None
+
+    def freshest_usable(self, param: str, max_age_min: float = 24 * 60) -> Optional[Measurement]:
+        """
+        Приоритет СВЕЖЕСТИ, независимо от источника.
+
+        Отличается от best_quality сознательно, и выбор между ними — это
+        выбор политики. Для якоря по сере нужен самый свежий факт: ПАК
+        меряет каждые 10 минут, лаборатория несколько раз в сутки, и
+        шестичасовой лабораторный результат описывает уже не тот продукт.
+        Расхождение источников при этом не отбрасывается, а уходит в
+        неопределённость прогноза (agents/quality.py._sulfur_anchored).
+        """
+        usable = self.usable_sources(param, max_age_min)
+        return min(usable, key=lambda m: m.age_min) if usable else None
 
 
 # --------------------------------------------------------------------------
@@ -126,18 +152,23 @@ class QualityAssess:
     """
     Ответ агента качества.
 
-    predictions     — показатель -> Interval. Ключи: 'sulfur_mgkg', 'cfpp_c',
-                      'flash_c', 'd15_kgm3', 'ebp_c'
+    predictions     — показатель -> Interval. Ключи те же, что в
+                      quality_specs конфига: 'sulfur_mgkg', 'flash_c',
+                      'cfpp_c', 'd15_kgm3'
     spec_risk_prob  — 0..1, вероятность нарушить хотя бы одно требование спеки
     confidence      — 0..1, доверие к самому прогнозу.
                       Падает при старом ЛИМС, залипшем ПАК, режиме вне обучающей области.
-    drivers         — человекочитаемые причины, идут в объяснение оператору
+    drivers         — человекочитаемые причины риска, идут в объяснение
+    confidence_drivers — что именно снизило доверие. Считает тот же агент,
+                      который считает confidence: иначе отчёт вынужден
+                      угадывать причину и выдаёт неверную.
     model_id        — что за модель отработала, для воспроизводимости
     """
     predictions: Dict[str, Interval] = field(default_factory=dict)
     spec_risk_prob: float = 0.0
     confidence: float = 0.0
     drivers: List[str] = field(default_factory=list)
+    confidence_drivers: List[str] = field(default_factory=list)
     model_id: str = "stub"
     schema_version: str = SCHEMA_VERSION
 
@@ -202,14 +233,20 @@ class GateVerdict:
     """
     Результат проверки одного кандидата. Только числа, никаких рассуждений.
 
-    violated — список нарушений человекочитаемо
+    violated — нарушения ЖЁСТКИХ ограничений. Непустой список = passed False.
+    warnings — нарушения МОДЕЛЬНЫХ ДОПУЩЕНИЙ (source: assumption).
+               Кандидат остаётся допустимым, но оператор обязан это видеть.
+               ТЗ запрещает выдавать наше допущение за промышленный предел,
+               поэтому отбраковывать по нему нельзя, а молчать — нечестно.
     margins  — ограничение -> запас. Положительный = есть запас.
                Нужен и для ранжирования, и для фразы в отчёте.
+               Считается одинаково и для жёстких, и для мягких ограничений.
     checked  — какие проверки вообще прогнали (идёт в 'Проверка ограничений')
     """
     candidate_id: str
     passed: bool
     violated: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
     margins: Dict[str, float] = field(default_factory=dict)
     checked: List[str] = field(default_factory=list)
     schema_version: str = SCHEMA_VERSION
@@ -235,6 +272,13 @@ class Recommendation:
     reason: str
     expected_effect: Dict[str, Any] = field(default_factory=dict)
     checks_passed: List[str] = field(default_factory=list)
+    # Что осталось нарушенным. Заполняется в режиме восстановления (продукт
+    # уже вне спецификации, выдано лучшее улучшение за один шаг) и при
+    # отказе по невыполнимости — тогда это нарушения при бездействии.
+    checks_failed: List[str] = field(default_factory=list)
+    # Нарушенные модельные допущения: рекомендация остаётся допустимой,
+    # но оператор видит, какое из НАШИХ предположений она задевает.
+    checks_warned: List[str] = field(default_factory=list)
     confidence: float = 0.0
     explanation: str = ""
     alternatives: List[Dict[str, Any]] = field(default_factory=list)

@@ -25,8 +25,10 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
+import numpy as np
+
 from ..contracts import Interval, ProcessState, QualityAssess
-from ..data.tags import quality_specs, refusal_rules
+from ..data.tags import load_config, quality_specs, refusal_rules
 from ..models import load_default_avt, load_default_go
 from ..models.features import catalyst_age_days_scalar
 
@@ -56,13 +58,14 @@ class QualityAgent:
         """
         deltas = deltas or {}
         preds = self._predict(state, deltas)
-        conf = self._confidence(state)
+        conf, conf_drivers = self._confidence(state)
         risk = self._spec_risk(preds)
         return QualityAssess(
             predictions=preds,
             spec_risk_prob=risk,
             confidence=conf,
             drivers=self._drivers(state, deltas),
+            confidence_drivers=conf_drivers,
             model_id=self.model_id,
         )
 
@@ -118,29 +121,96 @@ class QualityAgent:
         self._last_go_delta = {
             k: go_new[k].mean - go_now[k].mean for k in go_new
         }  # для _drivers(), объяснимость эффекта действия
+
+        go_new["sulfur_mgkg"] = self._sulfur_anchored(
+            state, go_now["sulfur_mgkg"], go_new["sulfur_mgkg"]
+        )
         return go_new
 
     # ------------------------------------------------------------------
-    def _confidence(self, state: ProcessState) -> float:
+    def _sulfur_anchored(
+        self, state: ProcessState, now_iv: Interval, new_iv: Interval
+    ) -> Interval:
+        """
+        Уровень серы даёт ИЗМЕРЕНИЕ, модель отвечает только за эффект действия.
+
+        Абсолютный прогноз GOModel честен, но его conformal-интервал шириной
+        6.3 мг/кг при лимите 10 не проходит Gate никогда, включая вариант
+        "ничего не менять": жёсткая проверка идёт по hi. При этом сера
+        измеряется напрямую — ПАК каждые 10 минут, ЛИМС несколько раз в
+        сутки, — и измерение на порядок точнее модели. Поэтому уровень
+        берётся из измерения, а модель даёт разницу между текущим и
+        предлагаемым режимом. Это стандартная практика inferential control
+        (bias update по лабораторному результату), а не ослабление проверки.
+
+        Ширина интервала складывается из трёх слагаемых:
+          1. q90 роста серы за время с момента анализа плюс один цикл
+             управления — эмпирика по ПАК, config/constraints.yaml;
+          2. расхождение ЛИМС и ПАК, когда доступны оба. ТЗ называет
+             лабораторный результат контрольным фактом, поэтому разница
+             источников уходит в неопределённость, а не отбрасывается;
+          3. доля предсказанного эффекта, которая может не реализоваться.
+
+        Если пригодного измерения нет, возвращается абсолютный прогноз
+        модели как есть: широкий интервал тут — честный ответ, а не сбой.
+        """
+        cfg = load_config("constraints")["sulfur_anchor"]
+        max_age = refusal_rules()["max_lims_age_min"]
+        usable = state.usable_sources("sulfur_mgkg", max_age)
+        if not usable:
+            return new_iv
+
+        anchor = state.freshest_usable("sulfur_mgkg", max_age)
+        effect = new_iv.mean - now_iv.mean
+        horizon_min = cfg["cycle_min"] + anchor.age_min
+        grid = cfg["growth_q90_mgkg"]
+
+        half = float(np.interp(horizon_min, [p[0] for p in grid], [p[1] for p in grid]))
+        if len(usable) == 2:
+            half += abs(usable[0].value - usable[1].value)
+        half += cfg["effect_uncertainty_share"] * abs(effect)
+
+        mean = anchor.value + effect
+        return Interval(mean, mean - half, mean + half)
+
+    # ------------------------------------------------------------------
+    def _confidence(self, state: ProcessState) -> tuple:
         """
         Доверие к прогнозу падает от старых и мёртвых данных.
         Это отдельная величина от spec_risk_prob.
+
+        Возвращает (доверие, причины снижения). Причины считает тот же код,
+        который считает число: иначе отчёт оператору вынужден угадывать,
+        что именно снизило доверие, и называет не тот фактор.
         """
         rules = refusal_rules()
         conf = 0.9
+        reasons = []
 
         lims = state.lims.get("sulfur_mgkg")
         if lims and lims.age_min is not None:
             over = lims.age_min / rules["max_lims_age_min"]
             if over > 1.0:
-                conf -= min(0.45, 0.25 * over)
+                penalty = min(0.45, 0.25 * over)
+                conf -= penalty
+                reasons.append(
+                    f"лабораторный анализ серы старше порога: "
+                    f"{lims.age_min / 60:.0f} ч (-{penalty:.2f})"
+                )
 
         pak = state.pak.get("sulfur_mgkg")
         if pak is not None and not pak.healthy:
             conf -= 0.30
+            reasons.append("поточный анализатор серы неисправен (-0.30)")
 
-        conf -= 0.05 * len(state.dq_flags)
-        return max(0.0, round(conf, 3))
+        if state.dq_flags:
+            conf -= 0.05 * len(state.dq_flags)
+            reasons.append(
+                f"флагов качества данных: {len(state.dq_flags)} "
+                f"(-{0.05 * len(state.dq_flags):.2f})"
+            )
+
+        return max(0.0, round(conf, 3)), reasons
 
     # ------------------------------------------------------------------
     def _spec_risk(self, preds: Dict[str, Interval]) -> float:
