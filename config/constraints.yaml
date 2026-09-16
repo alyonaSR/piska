@@ -111,7 +111,11 @@ manipulated_vars:
     units: "t/h"
     range: [104.3, 152.8]
     max_step: 2.5
-    grid_points: 5   # шаг 0.5, круглое число (Person 4)
+    grid_points: 1   # ИСПРАВЛЕНО (Person 4): было 5 (11 точек). При 1089
+                     # кандидатах на связке с обученной моделью Person 3
+                     # цикл занимал ~17с — тесты не укладывались в разумное
+                     # время. Теперь только границы trust region: -2.5/0/+2.5.
+    active: true     # активна в OptimizerAgent.propose() по умолчанию
     source: assumption
     comment: >
       Схема К-2: синее кольцо на выходе К-9, тяжёлый дизельный поток.
@@ -127,7 +131,8 @@ manipulated_vars:
     units: "t/h"
     range: [58.2, 96.1]
     max_step: 2.0
-    grid_points: 4   # шаг 0.5, круглое число (Person 4)
+    grid_points: 1   # ИСПРАВЛЕНО (Person 4), см. комментарий у AVT:F30
+    active: true     # активна в OptimizerAgent.propose() по умолчанию
     source: assumption
     comment: >
       Схема К-2: синее кольцо на выходе К-9, лёгкий дизельный поток.
@@ -187,7 +192,9 @@ manipulated_vars:
     units: "degC"
     range: [353.8, 384.6]
     max_step: 2.5
-    grid_points: 5   # шаг 0.5, круглое число (Person 4)
+    grid_points: 5   # шаг 0.5, круглое число (Person 4). Разрешение
+                     # держим тонким — это главный рычаг компенсации серы.
+    active: true     # активна в OptimizerAgent.propose() по умолчанию
     source: assumption
     comment: >
       Единственная управляющая переменная со стороны гидроочистки и
