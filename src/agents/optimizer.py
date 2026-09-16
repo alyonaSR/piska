@@ -41,20 +41,19 @@ class OptimizerAgent:
         reliability: ReliabilityAssess,
         active_vars: List[str] = None,
     ) -> List[Candidate]:
-        # ИСПРАВЛЕНО (Person 4): AVT:T33 убрана. По данным Person 1 (см.
-        # excluded_candidates в constraints.yaml) corr(T33, EBP)=-0.010 —
-        # это не рычаг, влияния на результат нет, только признак модели.
-        # Вместо неё — AVT:F32, второй по силе AVT-рычаг после T5 (corr
-        # с EBP +0.254). Полный набор из 6 обоснованных переменных
-        # (F30/F32/F28/F14/P22/T5) уже лежит в constraints.yaml с
-        # grid_points, но полным перебором по всем 6 сразу через grid
-        # search работать не может: 11*11*9*11*13*7 ≈ 1.3 млн комбинаций.
-        # Роадмап самого файла говорит "шаг 1: сетка по 2-3 переменным" —
-        # держим 3 по умолчанию, остальные три подключаются явно через
-        # active_vars=[...] и ждут шага 2 (scipy/optuna), где полный
-        # перебор не нужен.
-        active_vars = active_vars or ["242000:T5", "AVT:F30", "AVT:F32"]
+        # ИСПРАВЛЕНО (Person 4): active_vars больше не зашиты в коде —
+        # источник истины один, config/constraints.yaml, поле active: true.
+        # Ксения поймала ловушку: код и конфиг расходились (T33 убрали
+        # из конфига, из кода — нет), у всей команды падало с KeyError.
+        # Явный active_vars=[...] по-прежнему работает и имеет приоритет
+        # (например, шаг 2 с optuna может гонять весь набор из 6).
         specs = manipulated_vars()
+        active_vars = active_vars or [tag for tag, spec in specs.items() if spec.get("active")]
+        if not active_vars:
+            raise ValueError(
+                "ни одна управляемая переменная не помечена active: true "
+                "в config/constraints.yaml, и active_vars не передан явно"
+            )
  
         grids: Dict[str, List[float]] = {}
         for tag in active_vars:
@@ -119,16 +118,25 @@ class OptimizerAgent:
  
         Условные единицы за цикл:
           +1.0 за каждый градус температуры реактора 242000:T5 (топливо + водород)
+          +0.1 за каждую т/ч пара в стриппинг AVT:F28 (пар стоит денег)
         Рост отбора (AVT:F30, AVT:F32) в cost_proxy не входит — он есть
         в yield_delta. AVT:T33 убрана вместе с исключением из active_vars
         (см. propose()) — она не рычаг, а только признак модели.
- 
-        TODO(Person 4): заменить вес на реальные энергозатраты, когда
-        появится хоть один экономический источник данных. Также нет пока
-        слагаемого для AVT:F28 (пар в стриппинг) — расход пара стоит
-        денег, но это вне активных по умолчанию переменных.
+
+        ИСПРАВЛЕНО (Person 4, по замечанию коллеги): AVT:F28 не входит в
+        active_vars по умолчанию, но если кто-то передаст его явным
+        active_vars=[...] (например, при переходе на optuna), пар не
+        должен доставаться бесплатно — раньше при активации F28 оптимизатор
+        считал бы расход пара нулевой ценой. Вес 0.1 условный, тот же
+        TODO ниже.
+
+        TODO(Person 4): заменить оба веса на реальные энергозатраты, когда
+        появится хоть один экономический источник данных.
         """
-        return 1.0 * deltas.get("242000:T5", 0.0)
+        return (
+            1.0 * deltas.get("242000:T5", 0.0)
+            + 0.1 * deltas.get("AVT:F28", 0.0)
+        )
  
     @staticmethod
     def _severity_delta(deltas: Dict[str, float]) -> float:
@@ -139,13 +147,21 @@ class OptimizerAgent:
     @staticmethod
     def pareto_front(candidates: List[Candidate]) -> List[Candidate]:
         """
-        Недоминируемые точки по (cost_proxy, severity_delta, sulfur hi).
-        Все три минимизируются. Необязательный пункт ТЗ, но дешёвый.
+        Недоминируемые точки по (cost_proxy, severity_delta, sulfur hi, -yield).
+        Первые три минимизируются, выпуск максимизируется (поэтому со знаком
+        минус — единый порядок сравнения "меньше = лучше" по всем осям).
+
+        ИСПРАВЛЕНО (Ксения нашла): раньше выпуск в ключ не входил, а
+        cost_proxy и severity_delta оба зависят только от 242000:T5. Все
+        точки с одинаковой температурой были неотличимы по ключу — во
+        фронт попадали варианты с буквально одинаковыми (cost, severity,
+        sulfur), различавшиеся только отбором, который на исход не влиял.
+        Теперь отбор — четвёртая ось, вырождение снято.
         """
         def key(c: Candidate):
             s = c.predicted.get("sulfur_mgkg")
-            return (c.cost_proxy, c.severity_delta, s.hi if s else 0.0)
- 
+            return (c.cost_proxy, c.severity_delta, s.hi if s else 0.0, -c.yield_delta)
+
         front: List[Candidate] = []
         for c in candidates:
             kc = key(c)
