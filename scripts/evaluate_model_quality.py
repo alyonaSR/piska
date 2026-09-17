@@ -91,8 +91,8 @@ def main():
 
     # --- AVTModel ---
     avt_points = sorted(p for p in lims["sample_point"].unique() if "АВТ" in p)
-    for out, (fn, tags, _fb) in AVT_SPECS.items():
-        t = build_avt_table(out, fn, tags, tel_avt, lims, avt_points)
+    for out, (fn, tags, extra, _fb) in AVT_SPECS.items():
+        t = build_avt_table(out, fn, tags, tags + extra, tel_avt, lims, avt_points)
         if t is None:
             print(f"AVTModel.{out:<16} нет обучающей таблицы (formula-only) -- пропуск")
             continue

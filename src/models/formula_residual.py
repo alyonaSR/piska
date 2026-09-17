@@ -48,6 +48,20 @@ def _safe_name(col: str) -> str:
     return col.replace(":", "__")
 
 
+def _as_float_or_nan(v):
+    """
+    Найдено Person 1 (прогон полного цикла, воспроизведено и подтверждено):
+    отсутствующий тег -> features.get(c) -> None -> колонка DataFrame
+    получает dtype=object -> LightGBM.predict() падает с ValueError вместо
+    штатной обработки пропуска. В реальной эксплуатации дырка в теге --
+    рутина (поверка датчика, обрыв связи, пропуск в архиве), а не повод
+    ронять весь цикл принятия решения. np.nan -- плавающая точка, у
+    LightGBM для неё есть нативный механизм missing values (выбор ветки
+    по default direction), это не костыль поверх модели.
+    """
+    return float(v) if v is not None else np.nan
+
+
 @dataclass
 class FormulaPlusResidual:
     name: str
@@ -172,7 +186,13 @@ class FormulaPlusResidual:
             half = 8.0
             return Interval(base, base - half, base + half)
 
-        row = pd.DataFrame([{c: features.get(c) for c in self.feature_cols}])
+        # features.get(c) -> None для отсутствующего тега (поверка датчика,
+        # обрыв связи, пропуск в архиве -- рутина в реальной эксплуатации).
+        # None в колонке DataFrame даёт dtype=object, LightGBM.predict()
+        # падает с ValueError вместо штатной обработки пропуска: nan
+        # плавает как float, LightGBM держит выбор ветки для пропусков
+        # нативно (это его обычный механизм missing values, не костыль).
+        row = pd.DataFrame([{c: _as_float_or_nan(features.get(c)) for c in self.feature_cols}])
         safe_row = row[self.feature_cols].rename(columns=_safe_name)
         resid = float(self._model.predict(safe_row)[0])
         # + resid_bias: коррекция систематического сдвига калибровки, см. fit()
@@ -199,7 +219,7 @@ class FormulaPlusResidual:
         """
         if self._model is None or self._conformal is None:
             return
-        row = pd.DataFrame([{c: features.get(c) for c in self.feature_cols}])
+        row = pd.DataFrame([{c: _as_float_or_nan(features.get(c)) for c in self.feature_cols}])
         safe_row = row[self.feature_cols].rename(columns=_safe_name)
         resid = float(self._model.predict(safe_row)[0])
         pred = self.baseline(features) + resid + self._resid_bias

@@ -53,19 +53,29 @@ from typing import Dict, Optional
 
 from ..contracts import Interval
 from . import vak_formulas as vak
-from .base import BaseQualityModel
+from .base import BaseQualityModel, monotone_vector
 from .formula_residual import FormulaPlusResidual
 
-# показатель -> (формула ВАК или None, требуемые теги, fallback-константа
-# на случай formula_fn=None и необученной модели -- иначе Interval(0,...)
-# физически бессмысленен и ломает Gate)
+# показатель -> (формула ВАК или None, теги формулы (физический baseline),
+# доп. признаки ТОЛЬКО для остатка -- не входят в формулу, но модель
+# вольна найти в них сигнал, fallback-константа на случай formula_fn=None
+# и необученной модели -- иначе Interval(0,...) физически бессмысленен)
+#
+# AVT:F32 добавлена в feed_ebp_c как extra (Person 1, прогон полного
+# цикла): раньше изменение F32 не влияло на EBP вообще (формулы ВАК её
+# не содержат) при том что F32 -- активный рычаг оптимизатора, то есть
+# треть управляющих переменных не делала ничего. F32 физически связана
+# с тем же куском колонны (используется в формулах D15 и CFPP через
+# F65/(F32+F30)), поэтому сигнал правдоподобен -- пусть остаток решает
+# сам, а не гарантированно игнорирует.
 _SPECS = {
-    "feed_ebp_c": (vak.avt_240_350_ebp, vak.AVT_240_350["ebp_c"][1], 365.0),
-    "feed_d15_kgm3": (vak.avt_240_350_d15, vak.AVT_240_350["d15_kgm3"][1], 871.0),
-    # нет рабочей формулы для правильного куска -- используем теги EBP,
-    # residual-модель учится с нуля (formula_fn=None -> baseline=0)
-    "feed_cfpp_c": (None, vak.AVT_240_350["ebp_c"][1], -5.0),
-    "feed_flash_c": (None, vak.AVT_240_350["ebp_c"][1], 68.0),
+    "feed_ebp_c": (vak.avt_240_350_ebp, vak.AVT_240_350["ebp_c"][1], ["AVT:F32"], 365.0),
+    "feed_d15_kgm3": (vak.avt_240_350_d15, vak.AVT_240_350["d15_kgm3"][1], [], 871.0),
+    # ИСПРАВЛЕНО (формулы_ВАК.xlsx, 2026-09-17): формула не была сломана,
+    # была неверно транскрибирована (скобки), см. vak_formulas.py. Больше
+    # не formula_fn=None -- своя формула и свои теги, не заимствованные у EBP.
+    "feed_cfpp_c": (vak.avt_240_350_cfpp, vak.AVT_240_350["cfpp_c"][1], [], -5.0),
+    "feed_flash_c": (None, vak.AVT_240_350["ebp_c"][1], [], 68.0),
 }
 
 
@@ -82,14 +92,23 @@ class AVTModel(BaseQualityModel):
     """
 
     outputs = ["feed_ebp_c", "feed_d15_kgm3", "feed_cfpp_c", "feed_flash_c"]
-    required_features = sorted({t for _, tags, _ in _SPECS.values() for t in tags})
-    model_id = "avt_formula_residual_v1"
+    required_features = sorted({t for _, tags, extra, _ in _SPECS.values() for t in tags + extra})
+    model_id = "avt_formula_residual_v2"
 
     def __init__(self, models: Optional[Dict[str, FormulaPlusResidual]] = None):
         self._models = models or {
-            out: FormulaPlusResidual(name=out, formula_fn=fn, formula_tags=tags,
-                                      feature_cols=tags, fallback_mean=fb)
-            for out, (fn, tags, fb) in _SPECS.items()
+            out: FormulaPlusResidual(
+                name=out, formula_fn=fn, formula_tags=tags,
+                feature_cols=tags + extra, fallback_mean=fb,
+                # monotone constraints: см. base.EXPECTED_SIGNS и находку
+                # Person 1 (feed_ebp_c немонотонен по активному рычагу
+                # AVT:F30 -- переобучение остатка у края локальной
+                # плотности данных). Считается для feature_cols (tags+extra),
+                # не только formula_tags, чтобы extra-признаки без знака
+                # (F32) корректно получили 0, а не выпали из вектора.
+                monotone=monotone_vector(tags + extra, out),
+            )
+            for out, (fn, tags, extra, fb) in _SPECS.items()
         }
 
     # ------------------------------------------------------------------
@@ -118,7 +137,10 @@ class AVTModel(BaseQualityModel):
         import joblib
         states = joblib.load(path)
         models = {
-            out: FormulaPlusResidual.from_state(states[out], fn, tags, tags, fallback_mean=_fb)
-            for out, (fn, tags, _fb) in _SPECS.items()
+            out: FormulaPlusResidual.from_state(
+                states[out], fn, tags, tags + extra,
+                monotone=monotone_vector(tags + extra, out), fallback_mean=fb,
+            )
+            for out, (fn, tags, extra, fb) in _SPECS.items()
         }
         return cls(models=models)

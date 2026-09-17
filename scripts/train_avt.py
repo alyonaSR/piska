@@ -59,19 +59,28 @@ def best_point(pred: pd.Series, lims: pd.DataFrame, param: str, points: list, to
     return best_pt, best_corr, best_n
 
 
-def build_table(out: str, fn, tags: list, tel: pd.DataFrame, lims: pd.DataFrame, points: list):
-    """Возвращает (X, y) с общим DatetimeIndex, готовые для FormulaPlusResidual.fit."""
+def build_table(out: str, fn, formula_tags: list, feature_cols: list,
+                 tel: pd.DataFrame, lims: pd.DataFrame, points: list):
+    """
+    Возвращает (X, y) с общим DatetimeIndex, готовые для FormulaPlusResidual.fit.
+
+    formula_tags -- то, что реально ждёт fn() (baseline), feature_cols --
+    formula_tags + extra-признаки для остатка (например AVT:F32 у
+    feed_ebp_c). Точка отбора ЛИМС ищется по корреляции ФОРМУЛЫ, extra
+    в ней не участвует -- это признак для остатка, не для baseline.
+    """
     param = {"feed_ebp_c": "ebp_c", "feed_d15_kgm3": "d15_kgm3",
              "feed_cfpp_c": "cfpp_c", "feed_flash_c": "flash_c"}[out]
 
-    X_full = tel[tags].dropna()
-    pred = fn(X_full) if fn is not None else pd.Series(0.0, index=X_full.index)
+    X_formula = tel[formula_tags].dropna()
+    pred = fn(X_formula) if fn is not None else pd.Series(0.0, index=X_formula.index)
 
     pt, corr, n = best_point(pred, lims, param, points)
     if pt is None:
         print(f"  {out}: нет точки ЛИМС с параметром '{param}' (>=30 сопоставленных) -- пропуск")
         return None
 
+    X_full = tel[feature_cols].dropna()
     sub = lims[(lims["sample_point"] == pt) & (lims["param"] == param)][["ts", "value"]].dropna()
     left = X_full.reset_index().rename(columns={X_full.index.name or "index": "ts"})
     right = sub.sort_values("ts").rename(columns={"value": "y"})
@@ -80,7 +89,7 @@ def build_table(out: str, fn, tags: list, tel: pd.DataFrame, lims: pd.DataFrame,
     merged = merged.set_index("ts")
 
     print(f"  {out}: точка='{pt[:60]}...' n={len(merged)} |corr(формула,ЛИМС)|={corr:.3f}")
-    return merged[tags], merged["y"]
+    return merged[feature_cols], merged["y"]
 
 
 def main():
@@ -91,8 +100,8 @@ def main():
 
     print("\nСборка обучающих таблиц (as-of join, без утечки)...")
     tables = {}
-    for out, (fn, tags, _fb) in _SPECS.items():
-        t = build_table(out, fn, tags, tel, lims, points)
+    for out, (fn, tags, extra, _fb) in _SPECS.items():
+        t = build_table(out, fn, tags, tags + extra, tel, lims, points)
         if t is not None:
             tables[out] = t
 
