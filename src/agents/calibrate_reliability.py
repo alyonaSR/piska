@@ -54,7 +54,7 @@ def running_thresholds(avt: pd.DataFrame, ht: pd.DataFrame) -> Dict[str, float]:
     return {
         "running_min_t55": round(0.9 * float(avt["AVT:T55"].median()), 1),
         "running_min_t5": round(0.5 * float(ht["242000:T5"].median()), 1),
-        "running_min_f26": round(0.2 * float(ht["242000:F26"].median()), 1),
+        "running_min_f9": round(0.2 * float(ht["242000:F9"].median()), 1),
     }
 
 
@@ -63,7 +63,7 @@ def running_mask(avt: pd.DataFrame, ht: pd.DataFrame, thr: Dict[str, float]) -> 
     return (
         (avt["AVT:T55"] >= thr["running_min_t55"])
         & (ht["242000:T5"] >= thr["running_min_t5"])
-        & (ht["242000:F26"] >= thr["running_min_f26"])
+        & (ht["242000:F9"] >= thr["running_min_f9"])
     )
 
 
@@ -90,9 +90,13 @@ def build_factors(avt: pd.DataFrame, ht: pd.DataFrame, thr: Dict[str, float]) ->
     # 1. Уровень температуры реактора: выше — жёстче режим, быстрее коксование
     f["reactor_temp"] = ht["242000:T5"].where(ok)
 
-    # 2. Удельная нагрузка: выше расход — выше объёмная скорость, меньше
-    #    время пребывания в реакторе
-    f["load"] = ht["242000:F26"].where(ok)
+    # 2. Нагрузка: выше расход сырья — выше объёмная скорость, меньше
+    #    время пребывания в реакторе.
+    #    ВНИМАНИЕ: раньше здесь стоял 242000:F26. По ИСПРАВЛЕННОМУ справочнику
+    #    F26 — расход гидроочищенного ДТ в цех №8, то есть ПРОДУКТ, а сырьё
+    #    это F9 (массовый). Численно разницы почти нет: F9 и F26 коррелируют
+    #    на 1.000 с отношением 0.85 т/м3, но называть вещи надо правильно.
+    f["load"] = ht["242000:F9"].where(ok)
 
     # 3. Тепловое напряжение печи АВТ: превышение над скользящей целевой.
     #    Уставка DCS недоступна, прокси — медиана за 7 суток.
